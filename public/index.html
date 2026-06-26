@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Stickfight Multiplayer</title>
+    <title>Stickfight Multiplayer - Lokal spiller</title>
     <style>
         * {
             margin: 0;
@@ -111,35 +111,68 @@
 
         const socket = io();
 
-        let players = {};
-        let myId = null;
-        let keys = {};
-        let blockCooldown = false;
+        // ====== LOKAL SPILLER (100% klient-side) ======
+        const myPlayer = {
+            id: socket.id,
+            x: Math.random() * 700 + 50,
+            y: 440,
+            width: 30,
+            height: 60,
+            vx: 0,
+            vy: 0,
+            health: 100,
+            maxHealth: 100,
+            facingRight: true,
+            isAttacking: false,
+            isBlocking: false,
+            attackCooldown: 0,
+            blockCooldown: 0,
+            color: `hsl(${Math.random() * 360}, 70%, 50%)`,
+            onGround: false,
+            alive: true,
+            respawnTimer: 0,
+            attackBox: { x: 0, y: 0, width: 50, height: 50 },
+            knockbackVx: 0,
+            knockbackVy: 0
+        };
 
+        // ====== ANDRE SPILLERE (fra server) ======
+        let otherPlayers = {};
+
+        // ====== KONSTANTER ======
+        const GRAVITY = 0.6;
+        const JUMP_FORCE = -12;
         const GROUND_Y = 500;
-        const PLAYER_WIDTH = 30;
-        const PLAYER_HEIGHT = 60;
+        const PLAYER_SPEED = 5;
+        const ATTACK_DAMAGE = 10;
+        const BLOCK_KNOCKBACK = 15;
+        const ATTACK_COOLDOWN_TIME = 30; // frames
+        const BLOCK_COOLDOWN_TIME = 60; // frames
+        const RESPAWN_TIME = 180; // frames (3 sekunder ved 60fps)
 
+        // ====== EFFEKTER ======
         let blockEffects = [];
         let hitEffects = [];
+        let damageNumbers = [];
+
+        // ====== INPUT ======
+        let keys = {};
+        let blockKeyHeld = false;
 
         document.addEventListener('keydown', (e) => {
             keys[e.key.toLowerCase()] = true;
             
             if (e.key.toLowerCase() === 'e') {
-                socket.emit('playerAttack');
+                attack();
             }
             
-            if (e.key.toLowerCase() === 'f' && !blockCooldown) {
-                socket.emit('playerBlock', true);
-                blockCooldown = true;
-                
-                document.getElementById('block-cooldown-indicator').textContent = 'Blokering aktiv!';
-                
-                setTimeout(() => {
-                    blockCooldown = false;
-                    document.getElementById('block-cooldown-indicator').textContent = 'Blokering klar';
-                }, 2000);
+            if (e.key.toLowerCase() === 'f') {
+                if (!blockKeyHeld && myPlayer.blockCooldown <= 0) {
+                    blockKeyHeld = true;
+                    myPlayer.isBlocking = true;
+                    socket.emit('blockingState', true);
+                    document.getElementById('block-cooldown-indicator').textContent = 'Blokering aktiv!';
+                }
             }
             
             e.preventDefault();
@@ -149,90 +182,306 @@
             keys[e.key.toLowerCase()] = false;
             
             if (e.key.toLowerCase() === 'f') {
-                socket.emit('playerBlock', false);
-                document.getElementById('block-cooldown-indicator').textContent = 'Blokering klar';
+                blockKeyHeld = false;
+                myPlayer.isBlocking = false;
+                socket.emit('blockingState', false);
+                document.getElementById('block-cooldown-indicator').textContent = 
+                    myPlayer.blockCooldown > 0 ? 'Blokering på cooldown...' : 'Blokering klar';
             }
         });
 
-        socket.on('currentPlayers', (serverPlayers) => {
-            players = serverPlayers;
-            myId = socket.id;
+        // ====== ANGREB ======
+        function attack() {
+            if (!myPlayer.alive) return;
+            if (myPlayer.attackCooldown > 0) return;
+            
+            myPlayer.attackCooldown = ATTACK_COOLDOWN_TIME;
+            myPlayer.isAttacking = true;
+            
+            // Beregn attack box
+            const attackRange = 50;
+            myPlayer.attackBox = {
+                x: myPlayer.facingRight ? myPlayer.x + myPlayer.width : myPlayer.x - attackRange,
+                y: myPlayer.y + 10,
+                width: attackRange,
+                height: 40
+            };
+            
+            // Send attack event til server (så andre kan se animation)
+            socket.emit('attackEvent', {
+                attackX: myPlayer.attackBox.x,
+                attackY: myPlayer.attackBox.y,
+                attackWidth: myPlayer.attackBox.width,
+                attackHeight: myPlayer.attackBox.height,
+                direction: myPlayer.facingRight ? 1 : -1
+            });
+            
+            // Tjek hit på ALLE andre spillere LOKALT
+            Object.keys(otherPlayers).forEach(targetId => {
+                const target = otherPlayers[targetId];
+                if (!target.alive) return;
+                
+                // Tjek kollision mellem attack box og target
+                if (rectCollision(myPlayer.attackBox, {
+                    x: target.x,
+                    y: target.y,
+                    width: target.width || 30,
+                    height: target.height || 60
+                })) {
+                    if (target.isBlocking) {
+                        // BLOKERET! Angriber bliver skubbet væk
+                        const knockbackDir = myPlayer.facingRight ? -1 : 1;
+                        myPlayer.knockbackVx = knockbackDir * BLOCK_KNOCKBACK;
+                        myPlayer.knockbackVy = -8;
+                        
+                        // Blokerings effekt
+                        blockEffects.push({
+                            x: (myPlayer.x + target.x) / 2,
+                            y: (myPlayer.y + target.y) / 2,
+                            alpha: 1,
+                            scale: 0
+                        });
+                        
+                        // Fortæl serveren at target blokerede
+                        socket.emit('playerHit', {
+                            targetId: targetId,
+                            damage: 0,
+                            hitX: (myPlayer.x + target.x) / 2,
+                            hitY: (myPlayer.y + target.y) / 2,
+                            blocked: true
+                        });
+                    } else {
+                        // HIT! Target tager skade
+                        socket.emit('playerHit', {
+                            targetId: targetId,
+                            damage: ATTACK_DAMAGE,
+                            hitX: target.x + 15,
+                            hitY: target.y,
+                            blocked: false
+                        });
+                        
+                        // Vis skade lokalt
+                        hitEffects.push({
+                            x: target.x + 15,
+                            y: target.y,
+                            alpha: 1,
+                            text: `-${ATTACK_DAMAGE}`
+                        });
+                    }
+                }
+            });
+            
+            // Reset attack efter kort tid
+            setTimeout(() => {
+                myPlayer.isAttacking = false;
+            }, 200);
+        }
+
+        function rectCollision(rect1, rect2) {
+            return rect1.x < rect2.x + rect2.width &&
+                   rect1.x + rect1.width > rect2.x &&
+                   rect1.y < rect2.y + rect2.height &&
+                   rect1.y + rect1.height > rect2.y;
+        }
+
+        // ====== SOCKET EVENTS (modtag fra server) ======
+        socket.on('existingPlayers', (players) => {
+            otherPlayers = players;
         });
 
         socket.on('newPlayer', (player) => {
-            players[player.id] = player;
+            otherPlayers[player.id] = player;
         });
 
-        socket.on('playerDisconnected', (playerId) => {
-            delete players[playerId];
+        socket.on('playerUpdate', (player) => {
+            if (otherPlayers[player.id]) {
+                // Opdater kun hvis target ikke er os selv
+                otherPlayers[player.id] = {
+                    ...otherPlayers[player.id],
+                    x: player.x,
+                    y: player.y,
+                    facingRight: player.facingRight,
+                    isAttacking: player.isAttacking,
+                    isBlocking: player.isBlocking,
+                    health: player.health,
+                    alive: player.alive
+                };
+            }
         });
 
-        socket.on('gameState', (serverPlayers) => {
-            players = serverPlayers;
+        socket.on('playerBlocking', (data) => {
+            if (otherPlayers[data.playerId]) {
+                otherPlayers[data.playerId].isBlocking = data.isBlocking;
+            }
         });
 
-        socket.on('blockEffect', (data) => {
-            blockEffects.push({
-                x: data.blockX,
-                y: data.blockY,
-                alpha: 1,
-                scale: 0
-            });
+        socket.on('playerWasHit', (data) => {
+            // En anden spiller blev ramt - vis effekt
+            if (data.blocked) {
+                blockEffects.push({
+                    x: data.hitX,
+                    y: data.hitY,
+                    alpha: 1,
+                    scale: 0
+                });
+            } else {
+                hitEffects.push({
+                    x: data.hitX,
+                    y: data.hitY,
+                    alpha: 1,
+                    text: `-${data.damage}`
+                });
+                
+                // Opdater target's health lokalt
+                if (otherPlayers[data.targetId]) {
+                    otherPlayers[data.targetId].health -= data.damage;
+                    if (otherPlayers[data.targetId].health <= 0) {
+                        otherPlayers[data.targetId].alive = false;
+                        otherPlayers[data.targetId].health = 0;
+                    }
+                }
+                
+                // Hvis VI blev ramt
+                if (data.targetId === myPlayer.id) {
+                    myPlayer.health -= data.damage;
+                    if (myPlayer.health <= 0) {
+                        myPlayer.alive = false;
+                        myPlayer.health = 0;
+                        myPlayer.respawnTimer = RESPAWN_TIME;
+                        socket.emit('playerDeath', { killerId: data.attackerId });
+                    }
+                }
+            }
         });
 
-        socket.on('hitEffect', (data) => {
-            hitEffects.push({
-                x: players[data.targetId]?.x || 0,
-                y: players[data.targetId]?.y || 0,
-                damage: data.damage,
-                alpha: 1
-            });
-        });
-
-        socket.on('playerDied', (playerId) => {
-            if (playerId === myId) {
-                document.getElementById('health-text').textContent = '0/100';
+        socket.on('playerDied', (data) => {
+            if (otherPlayers[data.playerId]) {
+                otherPlayers[data.playerId].alive = false;
+                otherPlayers[data.playerId].health = 0;
             }
         });
 
         socket.on('playerRespawned', (player) => {
-            if (player.id === myId) {
-                document.getElementById('health-text').textContent = '100/100';
+            if (otherPlayers[player.id]) {
+                otherPlayers[player.id] = {
+                    ...otherPlayers[player.id],
+                    x: player.x,
+                    y: player.y,
+                    health: 100,
+                    alive: true
+                };
             }
         });
 
-        socket.on('attackAnimation', (playerId) => {
-            if (players[playerId]) {
-                players[playerId].attackAnim = 10;
-            }
+        socket.on('playerDisconnected', (playerId) => {
+            delete otherPlayers[playerId];
         });
 
-        socket.on('blockState', (data) => {
-            if (players[data.playerId]) {
-                players[data.playerId].isBlocking = data.isBlocking;
-            }
-        });
-
+        // ====== SPIL LOOP ======
         function update() {
-            const myPlayer = players[myId];
-            if (myPlayer && myPlayer.alive) {
-                socket.emit('playerMovement', {
-                    left: keys['arrowleft'] || keys['a'],
-                    right: keys['arrowright'] || keys['d'],
-                    jump: keys[' '] || keys['arrowup'] || keys['w'],
-                    facingRight: myPlayer.facingRight
+            if (myPlayer.alive) {
+                // === HÅNDTER INPUT (lokalt) ===
+                if (keys['arrowleft'] || keys['a']) {
+                    myPlayer.vx = -PLAYER_SPEED;
+                    myPlayer.facingRight = false;
+                } else if (keys['arrowright'] || keys['d']) {
+                    myPlayer.vx = PLAYER_SPEED;
+                    myPlayer.facingRight = true;
+                } else {
+                    myPlayer.vx = 0;
+                }
+                
+                if ((keys[' '] || keys['arrowup'] || keys['w']) && myPlayer.onGround) {
+                    myPlayer.vy = JUMP_FORCE;
+                    myPlayer.onGround = false;
+                }
+                
+                // === FYSIK (lokalt) ===
+                // Gravity
+                myPlayer.vy += GRAVITY;
+                
+                // Knockback
+                myPlayer.vx += myPlayer.knockbackVx;
+                myPlayer.vy += myPlayer.knockbackVy;
+                myPlayer.knockbackVx *= 0.8;
+                myPlayer.knockbackVy *= 0.8;
+                
+                // Position
+                myPlayer.x += myPlayer.vx;
+                myPlayer.y += myPlayer.vy;
+                
+                // Ground collision
+                if (myPlayer.y >= GROUND_Y - myPlayer.height) {
+                    myPlayer.y = GROUND_Y - myPlayer.height;
+                    myPlayer.vy = 0;
+                    myPlayer.onGround = true;
+                }
+                
+                // Wall collision
+                if (myPlayer.x < 0) {
+                    myPlayer.x = 0;
+                    myPlayer.vx = 0;
+                }
+                if (myPlayer.x > 800 - myPlayer.width) {
+                    myPlayer.x = 800 - myPlayer.width;
+                    myPlayer.vx = 0;
+                }
+                
+                // Friction
+                if (myPlayer.onGround) {
+                    myPlayer.vx *= 0.9;
+                }
+                
+                // Cooldowns
+                if (myPlayer.attackCooldown > 0) myPlayer.attackCooldown--;
+                if (myPlayer.blockCooldown > 0) {
+                    myPlayer.blockCooldown--;
+                    if (myPlayer.blockCooldown <= 0) {
+                        document.getElementById('block-cooldown-indicator').textContent = 'Blokering klar';
+                    }
+                }
+                
+                // Send position til server
+                socket.emit('updatePosition', {
+                    x: myPlayer.x,
+                    y: myPlayer.y,
+                    facingRight: myPlayer.facingRight,
+                    isAttacking: myPlayer.isAttacking,
+                    isBlocking: myPlayer.isBlocking,
+                    health: myPlayer.health,
+                    alive: myPlayer.alive
                 });
                 
-                const healthPercent = (myPlayer.health / 100) * 100;
+                // Opdater UI
+                const healthPercent = (myPlayer.health / myPlayer.maxHealth) * 100;
                 document.getElementById('health-bar').style.width = healthPercent + '%';
-                document.getElementById('health-text').textContent = `${Math.max(0, myPlayer.health)}/100`;
+                document.getElementById('health-text').textContent = `${Math.max(0, myPlayer.health)}/${myPlayer.maxHealth}`;
                 
                 const healthBar = document.getElementById('health-bar');
                 if (healthPercent > 60) healthBar.style.backgroundColor = '#4CAF50';
                 else if (healthPercent > 30) healthBar.style.backgroundColor = '#FFA500';
                 else healthBar.style.backgroundColor = '#FF0000';
+            } else {
+                // Død - respawn timer
+                myPlayer.respawnTimer--;
+                if (myPlayer.respawnTimer <= 0) {
+                    myPlayer.alive = true;
+                    myPlayer.health = myPlayer.maxHealth;
+                    myPlayer.x = Math.random() * 700 + 50;
+                    myPlayer.y = GROUND_Y - myPlayer.height;
+                    myPlayer.vx = 0;
+                    myPlayer.vy = 0;
+                    myPlayer.knockbackVx = 0;
+                    myPlayer.knockbackVy = 0;
+                    
+                    socket.emit('playerRespawn', {
+                        x: myPlayer.x,
+                        y: myPlayer.y
+                    });
+                }
             }
             
+            // Opdater effekter
             blockEffects = blockEffects.filter(effect => {
                 effect.alpha -= 0.05;
                 effect.scale += 2;
@@ -247,9 +496,11 @@
         }
 
         function render() {
+            // Baggrund
             ctx.fillStyle = '#1a1a2e';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             
+            // Jord
             ctx.fillStyle = '#2d2d44';
             ctx.fillRect(0, GROUND_Y, canvas.width, canvas.height - GROUND_Y);
             ctx.strokeStyle = '#4a4a6a';
@@ -259,96 +510,26 @@
             ctx.lineTo(canvas.width, GROUND_Y);
             ctx.stroke();
             
-            Object.values(players).forEach(player => {
+            // === TEGN ALLE ANDRE SPILLERE ===
+            Object.values(otherPlayers).forEach(player => {
                 if (!player.alive) return;
-                
-                ctx.save();
-                
-                if (!player.facingRight) {
-                    ctx.translate(player.x + PLAYER_WIDTH / 2, 0);
-                    ctx.scale(-1, 1);
-                    ctx.translate(-(player.x + PLAYER_WIDTH / 2), 0);
-                }
-                
-                ctx.fillStyle = player.color;
-                ctx.fillRect(player.x, player.y, PLAYER_WIDTH, PLAYER_HEIGHT);
-                
-                ctx.fillStyle = '#FFD700';
-                ctx.beginPath();
-                ctx.arc(player.x + PLAYER_WIDTH / 2, player.y + 10, 12, 0, Math.PI * 2);
-                ctx.fill();
-                
-                ctx.fillStyle = 'white';
-                ctx.beginPath();
-                ctx.arc(player.x + PLAYER_WIDTH / 2 + 4, player.y + 8, 4, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.fillStyle = 'black';
-                ctx.beginPath();
-                ctx.arc(player.x + PLAYER_WIDTH / 2 + 5, player.y + 8, 2, 0, Math.PI * 2);
-                ctx.fill();
-                
-                ctx.strokeStyle = player.color;
-                ctx.lineWidth = 3;
-                
-                ctx.beginPath();
-                ctx.moveTo(player.x, player.y + 20);
-                ctx.lineTo(player.x - 10, player.y + 35);
-                ctx.stroke();
-                
-                ctx.beginPath();
-                ctx.moveTo(player.x + PLAYER_WIDTH, player.y + 20);
-                if (player.isAttacking) {
-                    ctx.lineTo(player.x + PLAYER_WIDTH + 20, player.y + 10);
-                } else {
-                    ctx.lineTo(player.x + PLAYER_WIDTH + 10, player.y + 35);
-                }
-                ctx.stroke();
-                
-                ctx.strokeStyle = '#333';
-                ctx.lineWidth = 4;
-                
-                ctx.beginPath();
-                ctx.moveTo(player.x + 8, player.y + PLAYER_HEIGHT);
-                ctx.lineTo(player.x + 5, player.y + PLAYER_HEIGHT + 15);
-                ctx.stroke();
-                
-                ctx.beginPath();
-                ctx.moveTo(player.x + PLAYER_WIDTH - 8, player.y + PLAYER_HEIGHT);
-                ctx.lineTo(player.x + PLAYER_WIDTH - 5, player.y + PLAYER_HEIGHT + 15);
-                ctx.stroke();
-                
-                ctx.restore();
-                
-                if (player.isBlocking) {
-                    ctx.strokeStyle = 'rgba(100, 200, 255, 0.8)';
-                    ctx.lineWidth = 4;
-                    ctx.beginPath();
-                    ctx.arc(player.x + PLAYER_WIDTH / 2, player.y + PLAYER_HEIGHT / 2, 
-                           PLAYER_WIDTH, 0, Math.PI * 2);
-                    ctx.stroke();
-                    
-                    ctx.strokeStyle = 'rgba(100, 200, 255, 0.3)';
-                    ctx.lineWidth = 8;
-                    ctx.beginPath();
-                    ctx.arc(player.x + PLAYER_WIDTH / 2, player.y + PLAYER_HEIGHT / 2, 
-                           PLAYER_WIDTH + 5, 0, Math.PI * 2);
-                    ctx.stroke();
-                }
-                
-                ctx.fillStyle = 'white';
-                ctx.font = '12px Arial';
-                ctx.textAlign = 'center';
-                const displayName = player.id === myId ? 'DIG' : player.id.substring(0, 4);
-                ctx.fillText(displayName, player.x + PLAYER_WIDTH / 2, player.y - 10);
-                
-                if (player.health < 100) {
-                    ctx.fillStyle = 'red';
-                    ctx.fillRect(player.x - 5, player.y - 20, PLAYER_WIDTH + 10, 5);
-                    ctx.fillStyle = '#4CAF50';
-                    ctx.fillRect(player.x - 5, player.y - 20, (PLAYER_WIDTH + 10) * (player.health / 100), 5);
-                }
+                drawStickFigure(player.x, player.y, player.facingRight, player.isAttacking, 
+                               player.isBlocking, player.color, player.id, player.health);
             });
             
+            // === TEGN DIG SELV (altid øverst) ===
+            if (myPlayer.alive) {
+                drawStickFigure(myPlayer.x, myPlayer.y, myPlayer.facingRight, myPlayer.isAttacking,
+                               myPlayer.isBlocking, myPlayer.color, 'DIG', myPlayer.health);
+            } else {
+                // Vis respawn timer
+                ctx.fillStyle = 'white';
+                ctx.font = 'bold 24px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(`Respawn om ${Math.ceil(myPlayer.respawnTimer / 60)}s...`, 400, 300);
+            }
+            
+            // === TEGN EFFEKTER ===
             blockEffects.forEach(effect => {
                 ctx.strokeStyle = `rgba(255, 255, 255, ${effect.alpha})`;
                 ctx.lineWidth = 3;
@@ -366,14 +547,111 @@
                 ctx.fillStyle = `rgba(255, 100, 100, ${effect.alpha})`;
                 ctx.font = 'bold 20px Arial';
                 ctx.textAlign = 'center';
-                ctx.fillText(`-${effect.damage}`, effect.x + PLAYER_WIDTH / 2, effect.y);
+                ctx.fillText(effect.text, effect.x, effect.y);
             });
             
-            const alivePlayers = Object.values(players).filter(p => p.alive).length;
+            // Spiller antal
+            const aliveCount = Object.values(otherPlayers).filter(p => p.alive).length + (myPlayer.alive ? 1 : 0);
             ctx.fillStyle = 'white';
             ctx.font = '14px Arial';
             ctx.textAlign = 'right';
-            ctx.fillText(`Spillere: ${alivePlayers}`, canvas.width - 10, 20);
+            ctx.fillText(`Spillere: ${aliveCount}`, canvas.width - 10, 20);
+        }
+
+        function drawStickFigure(x, y, facingRight, isAttacking, isBlocking, color, name, health) {
+            ctx.save();
+            
+            // Vend hvis nødvendigt
+            if (!facingRight) {
+                ctx.translate(x + 15, 0);
+                ctx.scale(-1, 1);
+                ctx.translate(-(x + 15), 0);
+            }
+            
+            // Krop
+            ctx.fillStyle = color;
+            ctx.fillRect(x, y, 30, 60);
+            
+            // Hoved
+            ctx.fillStyle = '#FFD700';
+            ctx.beginPath();
+            ctx.arc(x + 15, y + 10, 12, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Øjne
+            ctx.fillStyle = 'white';
+            ctx.beginPath();
+            ctx.arc(x + 19, y + 8, 4, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = 'black';
+            ctx.beginPath();
+            ctx.arc(x + 20, y + 8, 2, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Arme
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 3;
+            
+            // Venstre arm
+            ctx.beginPath();
+            ctx.moveTo(x, y + 20);
+            ctx.lineTo(x - 10, y + 35);
+            ctx.stroke();
+            
+            // Højre arm (angrebsarm)
+            ctx.beginPath();
+            ctx.moveTo(x + 30, y + 20);
+            if (isAttacking) {
+                ctx.lineTo(x + 50, y + 10);
+            } else {
+                ctx.lineTo(x + 40, y + 35);
+            }
+            ctx.stroke();
+            
+            // Ben
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 4;
+            
+            ctx.beginPath();
+            ctx.moveTo(x + 8, y + 60);
+            ctx.lineTo(x + 5, y + 75);
+            ctx.stroke();
+            
+            ctx.beginPath();
+            ctx.moveTo(x + 22, y + 60);
+            ctx.lineTo(x + 25, y + 75);
+            ctx.stroke();
+            
+            ctx.restore();
+            
+            // Blokeringsskjold (tegnes uden for save/restore så det ikke spejlvendes)
+            if (isBlocking) {
+                ctx.strokeStyle = 'rgba(100, 200, 255, 0.8)';
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.arc(x + 15, y + 30, 35, 0, Math.PI * 2);
+                ctx.stroke();
+                
+                ctx.strokeStyle = 'rgba(100, 200, 255, 0.3)';
+                ctx.lineWidth = 8;
+                ctx.beginPath();
+                ctx.arc(x + 15, y + 30, 40, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+            
+            // Navn
+            ctx.fillStyle = 'white';
+            ctx.font = 'bold 12px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText(name, x + 15, y - 15);
+            
+            // Health bar
+            if (health < 100) {
+                ctx.fillStyle = 'red';
+                ctx.fillRect(x - 5, y - 25, 40, 5);
+                ctx.fillStyle = '#4CAF50';
+                ctx.fillRect(x - 5, y - 25, 40 * (health / 100), 5);
+            }
         }
 
         function gameLoop() {
@@ -382,7 +660,9 @@
             requestAnimationFrame(gameLoop);
         }
 
+        // Start spillet!
         gameLoop();
+        console.log('Spil startet! Din spiller er 100% lokal. Serveren viser dig kun til andre.');
     </script>
 </body>
 </html>
