@@ -7,7 +7,13 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIO(server);
 
-app.use(express.static(path.join(__dirname)));
+// VIGTIGT: Server statiske filer fra public mappen
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Route til forsiden - henter index.html fra public mappen
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 const players = {};
 const ATTACK_DAMAGE = 10;
@@ -206,4 +212,5 @@ setInterval(gameLoop, 1000 / 60);
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server kører på port ${PORT}`);
+    console.log(`Åbn http://localhost:${PORT} i din browser`);
 });
