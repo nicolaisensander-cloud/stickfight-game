@@ -1,1 +1,388 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stickfight Multiplayer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
 
+        body {
+            background-color: #0f0f23;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+        }
+
+        #game-container {
+            position: relative;
+            box-shadow: 0 0 20px rgba(100, 200, 255, 0.3);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        #gameCanvas {
+            display: block;
+            background-color: #1a1a2e;
+        }
+
+        #ui {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            padding: 10px;
+            pointer-events: none;
+        }
+
+        #health-bar-container {
+            width: 200px;
+            height: 20px;
+            background-color: #333;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        #health-bar {
+            height: 100%;
+            background-color: #4CAF50;
+            transition: width 0.3s ease, background-color 0.3s ease;
+            width: 100%;
+        }
+
+        #health-text {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            text-align: center;
+            color: white;
+            font-size: 12px;
+            line-height: 20px;
+            text-shadow: 1px 1px 2px black;
+        }
+
+        #controls-info {
+            text-align: center;
+            color: white;
+            margin-top: 10px;
+            font-size: 12px;
+            text-shadow: 1px 1px 2px black;
+        }
+
+        #controls-info p {
+            margin: 2px 0;
+        }
+
+        #block-cooldown-indicator {
+            color: #64c8ff;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="gameCanvas" width="800" height="600"></canvas>
+        <div id="ui">
+            <div id="health-bar-container">
+                <div id="health-bar"></div>
+                <span id="health-text">100/100</span>
+            </div>
+            <div id="controls-info">
+                <p>Piletaster: Bevægelse | Mellemrum: Hop | E: Angreb | F: Bloker</p>
+                <p id="block-cooldown-indicator">Blokering klar</p>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const socket = io();
+
+        let players = {};
+        let myId = null;
+        let keys = {};
+        let blockCooldown = false;
+
+        const GROUND_Y = 500;
+        const PLAYER_WIDTH = 30;
+        const PLAYER_HEIGHT = 60;
+
+        let blockEffects = [];
+        let hitEffects = [];
+
+        document.addEventListener('keydown', (e) => {
+            keys[e.key.toLowerCase()] = true;
+            
+            if (e.key.toLowerCase() === 'e') {
+                socket.emit('playerAttack');
+            }
+            
+            if (e.key.toLowerCase() === 'f' && !blockCooldown) {
+                socket.emit('playerBlock', true);
+                blockCooldown = true;
+                
+                document.getElementById('block-cooldown-indicator').textContent = 'Blokering aktiv!';
+                
+                setTimeout(() => {
+                    blockCooldown = false;
+                    document.getElementById('block-cooldown-indicator').textContent = 'Blokering klar';
+                }, 2000);
+            }
+            
+            e.preventDefault();
+        });
+
+        document.addEventListener('keyup', (e) => {
+            keys[e.key.toLowerCase()] = false;
+            
+            if (e.key.toLowerCase() === 'f') {
+                socket.emit('playerBlock', false);
+                document.getElementById('block-cooldown-indicator').textContent = 'Blokering klar';
+            }
+        });
+
+        socket.on('currentPlayers', (serverPlayers) => {
+            players = serverPlayers;
+            myId = socket.id;
+        });
+
+        socket.on('newPlayer', (player) => {
+            players[player.id] = player;
+        });
+
+        socket.on('playerDisconnected', (playerId) => {
+            delete players[playerId];
+        });
+
+        socket.on('gameState', (serverPlayers) => {
+            players = serverPlayers;
+        });
+
+        socket.on('blockEffect', (data) => {
+            blockEffects.push({
+                x: data.blockX,
+                y: data.blockY,
+                alpha: 1,
+                scale: 0
+            });
+        });
+
+        socket.on('hitEffect', (data) => {
+            hitEffects.push({
+                x: players[data.targetId]?.x || 0,
+                y: players[data.targetId]?.y || 0,
+                damage: data.damage,
+                alpha: 1
+            });
+        });
+
+        socket.on('playerDied', (playerId) => {
+            if (playerId === myId) {
+                document.getElementById('health-text').textContent = '0/100';
+            }
+        });
+
+        socket.on('playerRespawned', (player) => {
+            if (player.id === myId) {
+                document.getElementById('health-text').textContent = '100/100';
+            }
+        });
+
+        socket.on('attackAnimation', (playerId) => {
+            if (players[playerId]) {
+                players[playerId].attackAnim = 10;
+            }
+        });
+
+        socket.on('blockState', (data) => {
+            if (players[data.playerId]) {
+                players[data.playerId].isBlocking = data.isBlocking;
+            }
+        });
+
+        function update() {
+            const myPlayer = players[myId];
+            if (myPlayer && myPlayer.alive) {
+                socket.emit('playerMovement', {
+                    left: keys['arrowleft'] || keys['a'],
+                    right: keys['arrowright'] || keys['d'],
+                    jump: keys[' '] || keys['arrowup'] || keys['w'],
+                    facingRight: myPlayer.facingRight
+                });
+                
+                const healthPercent = (myPlayer.health / 100) * 100;
+                document.getElementById('health-bar').style.width = healthPercent + '%';
+                document.getElementById('health-text').textContent = `${Math.max(0, myPlayer.health)}/100`;
+                
+                const healthBar = document.getElementById('health-bar');
+                if (healthPercent > 60) healthBar.style.backgroundColor = '#4CAF50';
+                else if (healthPercent > 30) healthBar.style.backgroundColor = '#FFA500';
+                else healthBar.style.backgroundColor = '#FF0000';
+            }
+            
+            blockEffects = blockEffects.filter(effect => {
+                effect.alpha -= 0.05;
+                effect.scale += 2;
+                return effect.alpha > 0;
+            });
+            
+            hitEffects = hitEffects.filter(effect => {
+                effect.alpha -= 0.03;
+                effect.y -= 2;
+                return effect.alpha > 0;
+            });
+        }
+
+        function render() {
+            ctx.fillStyle = '#1a1a2e';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.fillStyle = '#2d2d44';
+            ctx.fillRect(0, GROUND_Y, canvas.width, canvas.height - GROUND_Y);
+            ctx.strokeStyle = '#4a4a6a';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(0, GROUND_Y);
+            ctx.lineTo(canvas.width, GROUND_Y);
+            ctx.stroke();
+            
+            Object.values(players).forEach(player => {
+                if (!player.alive) return;
+                
+                ctx.save();
+                
+                if (!player.facingRight) {
+                    ctx.translate(player.x + PLAYER_WIDTH / 2, 0);
+                    ctx.scale(-1, 1);
+                    ctx.translate(-(player.x + PLAYER_WIDTH / 2), 0);
+                }
+                
+                ctx.fillStyle = player.color;
+                ctx.fillRect(player.x, player.y, PLAYER_WIDTH, PLAYER_HEIGHT);
+                
+                ctx.fillStyle = '#FFD700';
+                ctx.beginPath();
+                ctx.arc(player.x + PLAYER_WIDTH / 2, player.y + 10, 12, 0, Math.PI * 2);
+                ctx.fill();
+                
+                ctx.fillStyle = 'white';
+                ctx.beginPath();
+                ctx.arc(player.x + PLAYER_WIDTH / 2 + 4, player.y + 8, 4, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = 'black';
+                ctx.beginPath();
+                ctx.arc(player.x + PLAYER_WIDTH / 2 + 5, player.y + 8, 2, 0, Math.PI * 2);
+                ctx.fill();
+                
+                ctx.strokeStyle = player.color;
+                ctx.lineWidth = 3;
+                
+                ctx.beginPath();
+                ctx.moveTo(player.x, player.y + 20);
+                ctx.lineTo(player.x - 10, player.y + 35);
+                ctx.stroke();
+                
+                ctx.beginPath();
+                ctx.moveTo(player.x + PLAYER_WIDTH, player.y + 20);
+                if (player.isAttacking) {
+                    ctx.lineTo(player.x + PLAYER_WIDTH + 20, player.y + 10);
+                } else {
+                    ctx.lineTo(player.x + PLAYER_WIDTH + 10, player.y + 35);
+                }
+                ctx.stroke();
+                
+                ctx.strokeStyle = '#333';
+                ctx.lineWidth = 4;
+                
+                ctx.beginPath();
+                ctx.moveTo(player.x + 8, player.y + PLAYER_HEIGHT);
+                ctx.lineTo(player.x + 5, player.y + PLAYER_HEIGHT + 15);
+                ctx.stroke();
+                
+                ctx.beginPath();
+                ctx.moveTo(player.x + PLAYER_WIDTH - 8, player.y + PLAYER_HEIGHT);
+                ctx.lineTo(player.x + PLAYER_WIDTH - 5, player.y + PLAYER_HEIGHT + 15);
+                ctx.stroke();
+                
+                ctx.restore();
+                
+                if (player.isBlocking) {
+                    ctx.strokeStyle = 'rgba(100, 200, 255, 0.8)';
+                    ctx.lineWidth = 4;
+                    ctx.beginPath();
+                    ctx.arc(player.x + PLAYER_WIDTH / 2, player.y + PLAYER_HEIGHT / 2, 
+                           PLAYER_WIDTH, 0, Math.PI * 2);
+                    ctx.stroke();
+                    
+                    ctx.strokeStyle = 'rgba(100, 200, 255, 0.3)';
+                    ctx.lineWidth = 8;
+                    ctx.beginPath();
+                    ctx.arc(player.x + PLAYER_WIDTH / 2, player.y + PLAYER_HEIGHT / 2, 
+                           PLAYER_WIDTH + 5, 0, Math.PI * 2);
+                    ctx.stroke();
+                }
+                
+                ctx.fillStyle = 'white';
+                ctx.font = '12px Arial';
+                ctx.textAlign = 'center';
+                const displayName = player.id === myId ? 'DIG' : player.id.substring(0, 4);
+                ctx.fillText(displayName, player.x + PLAYER_WIDTH / 2, player.y - 10);
+                
+                if (player.health < 100) {
+                    ctx.fillStyle = 'red';
+                    ctx.fillRect(player.x - 5, player.y - 20, PLAYER_WIDTH + 10, 5);
+                    ctx.fillStyle = '#4CAF50';
+                    ctx.fillRect(player.x - 5, player.y - 20, (PLAYER_WIDTH + 10) * (player.health / 100), 5);
+                }
+            });
+            
+            blockEffects.forEach(effect => {
+                ctx.strokeStyle = `rgba(255, 255, 255, ${effect.alpha})`;
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.arc(effect.x, effect.y, effect.scale, 0, Math.PI * 2);
+                ctx.stroke();
+                
+                ctx.fillStyle = `rgba(100, 200, 255, ${effect.alpha * 0.5})`;
+                ctx.beginPath();
+                ctx.arc(effect.x, effect.y, effect.scale * 0.7, 0, Math.PI * 2);
+                ctx.fill();
+            });
+            
+            hitEffects.forEach(effect => {
+                ctx.fillStyle = `rgba(255, 100, 100, ${effect.alpha})`;
+                ctx.font = 'bold 20px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(`-${effect.damage}`, effect.x + PLAYER_WIDTH / 2, effect.y);
+            });
+            
+            const alivePlayers = Object.values(players).filter(p => p.alive).length;
+            ctx.fillStyle = 'white';
+            ctx.font = '14px Arial';
+            ctx.textAlign = 'right';
+            ctx.fillText(`Spillere: ${alivePlayers}`, canvas.width - 10, 20);
+        }
+
+        function gameLoop() {
+            update();
+            render();
+            requestAnimationFrame(gameLoop);
+        }
+
+        gameLoop();
+    </script>
+</body>
+</html>
