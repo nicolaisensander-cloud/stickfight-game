@@ -1,7 +1,7 @@
 {
   "name": "stickfight-multiplayer",
   "version": "1.0.0",
-  "description": "Multiplayer Stick Fight Game med lokal spiller",
+  "description": "Multiplayer Stick Fight Game med stickman og blokering",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
