@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Stickfight Multiplayer - Lokal spiller</title>
+    <title>Stickfight Multiplayer - Stickman</title>
     <style>
         * {
             margin: 0;
@@ -83,8 +83,14 @@
             margin: 2px 0;
         }
 
-        #block-cooldown-indicator {
+        #block-indicator {
             color: #64c8ff;
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        #block-timer {
+            color: #ffcc00;
             font-weight: bold;
         }
     </style>
@@ -98,8 +104,9 @@
                 <span id="health-text">100/100</span>
             </div>
             <div id="controls-info">
-                <p>Piletaster: Bevægelse | Mellemrum: Hop | E: Angreb | F: Bloker</p>
-                <p id="block-cooldown-indicator">Blokering klar</p>
+                <p>Piletaster/A,D: Bevægelse | Mellemrum/W: Hop | E: Angreb | Hold F: Bloker</p>
+                <p id="block-indicator">Blokering klar</p>
+                <p id="block-timer"></p>
             </div>
         </div>
     </div>
@@ -126,7 +133,8 @@
             isAttacking: false,
             isBlocking: false,
             attackCooldown: 0,
-            blockCooldown: 0,
+            blockTimer: 0,        // Hvor længe man har blokeret (maks 3 sek = 180 frames)
+            blockCooldownTimer: 0, // Cooldown efter blokering (2 sek = 120 frames)
             color: `hsl(${Math.random() * 360}, 70%, 50%)`,
             onGround: false,
             alive: true,
@@ -147,32 +155,22 @@
         const ATTACK_DAMAGE = 10;
         const BLOCK_KNOCKBACK = 15;
         const ATTACK_COOLDOWN_TIME = 30; // frames
-        const BLOCK_COOLDOWN_TIME = 60; // frames
-        const RESPAWN_TIME = 180; // frames (3 sekunder ved 60fps)
+        const MAX_BLOCK_TIME = 180;      // 3 sekunder (60 fps * 3)
+        const BLOCK_COOLDOWN_TIME = 120;  // 2 sekunder (60 fps * 2)
+        const RESPAWN_TIME = 180;        // 3 sekunder
 
         // ====== EFFEKTER ======
         let blockEffects = [];
         let hitEffects = [];
-        let damageNumbers = [];
 
         // ====== INPUT ======
         let keys = {};
-        let blockKeyHeld = false;
 
         document.addEventListener('keydown', (e) => {
             keys[e.key.toLowerCase()] = true;
             
             if (e.key.toLowerCase() === 'e') {
                 attack();
-            }
-            
-            if (e.key.toLowerCase() === 'f') {
-                if (!blockKeyHeld && myPlayer.blockCooldown <= 0) {
-                    blockKeyHeld = true;
-                    myPlayer.isBlocking = true;
-                    socket.emit('blockingState', true);
-                    document.getElementById('block-cooldown-indicator').textContent = 'Blokering aktiv!';
-                }
             }
             
             e.preventDefault();
@@ -182,18 +180,40 @@
             keys[e.key.toLowerCase()] = false;
             
             if (e.key.toLowerCase() === 'f') {
-                blockKeyHeld = false;
-                myPlayer.isBlocking = false;
-                socket.emit('blockingState', false);
-                document.getElementById('block-cooldown-indicator').textContent = 
-                    myPlayer.blockCooldown > 0 ? 'Blokering på cooldown...' : 'Blokering klar';
+                // Slip F = stop blokering
+                if (myPlayer.isBlocking) {
+                    stopBlocking();
+                }
             }
         });
+
+        function startBlocking() {
+            if (!myPlayer.alive) return;
+            if (myPlayer.blockCooldownTimer > 0) return;
+            if (myPlayer.blockTimer >= MAX_BLOCK_TIME) return;
+            
+            myPlayer.isBlocking = true;
+            socket.emit('blockingState', true);
+        }
+
+        function stopBlocking() {
+            myPlayer.isBlocking = false;
+            socket.emit('blockingState', false);
+            
+            // Start cooldown hvis man har blokeret
+            if (myPlayer.blockTimer > 0) {
+                myPlayer.blockCooldownTimer = BLOCK_COOLDOWN_TIME;
+            }
+            myPlayer.blockTimer = 0;
+        }
 
         // ====== ANGREB ======
         function attack() {
             if (!myPlayer.alive) return;
             if (myPlayer.attackCooldown > 0) return;
+            
+            // Kan ikke angribe mens man blokerer
+            if (myPlayer.isBlocking) return;
             
             myPlayer.attackCooldown = ATTACK_COOLDOWN_TIME;
             myPlayer.isAttacking = true;
@@ -295,7 +315,6 @@
 
         socket.on('playerUpdate', (player) => {
             if (otherPlayers[player.id]) {
-                // Opdater kun hvis target ikke er os selv
                 otherPlayers[player.id] = {
                     ...otherPlayers[player.id],
                     x: player.x,
@@ -316,7 +335,6 @@
         });
 
         socket.on('playerWasHit', (data) => {
-            // En anden spiller blev ramt - vis effekt
             if (data.blocked) {
                 blockEffects.push({
                     x: data.hitX,
@@ -332,7 +350,6 @@
                     text: `-${data.damage}`
                 });
                 
-                // Opdater target's health lokalt
                 if (otherPlayers[data.targetId]) {
                     otherPlayers[data.targetId].health -= data.damage;
                     if (otherPlayers[data.targetId].health <= 0) {
@@ -341,7 +358,6 @@
                     }
                 }
                 
-                // Hvis VI blev ramt
                 if (data.targetId === myPlayer.id) {
                     myPlayer.health -= data.damage;
                     if (myPlayer.health <= 0) {
@@ -396,28 +412,70 @@
                     myPlayer.onGround = false;
                 }
                 
+                // === BLOKERING (hold F) ===
+                if (keys['f']) {
+                    if (myPlayer.blockCooldownTimer <= 0) {
+                        // Kan blokere - start blokering
+                        if (!myPlayer.isBlocking && myPlayer.blockTimer < MAX_BLOCK_TIME) {
+                            startBlocking();
+                        }
+                    }
+                } else {
+                    // F er ikke holdt nede - stop blokering
+                    if (myPlayer.isBlocking) {
+                        stopBlocking();
+                    }
+                }
+                
+                // === OPDATER BLOKERING ===
+                if (myPlayer.isBlocking) {
+                    myPlayer.blockTimer++;
+                    
+                    // Opdater blokerings-timer UI
+                    const remainingBlock = Math.max(0, Math.ceil((MAX_BLOCK_TIME - myPlayer.blockTimer) / 60));
+                    document.getElementById('block-timer').textContent = 
+                        `Blokering: ${remainingBlock}s tilbage`;
+                    
+                    // Maks blokeringstid nået - tvungen stop
+                    if (myPlayer.blockTimer >= MAX_BLOCK_TIME) {
+                        stopBlocking();
+                        document.getElementById('block-timer').textContent = '';
+                        document.getElementById('block-indicator').textContent = 'Blokering opbrugt! Cooldown...';
+                    }
+                }
+                
+                // === BLOKERING COOLDOWN ===
+                if (myPlayer.blockCooldownTimer > 0) {
+                    myPlayer.blockCooldownTimer--;
+                    
+                    const cooldownRemaining = Math.ceil(myPlayer.blockCooldownTimer / 60);
+                    document.getElementById('block-indicator').textContent = 
+                        `Blokering cooldown: ${cooldownRemaining}s`;
+                    document.getElementById('block-timer').textContent = '';
+                    
+                    if (myPlayer.blockCooldownTimer <= 0) {
+                        document.getElementById('block-indicator').textContent = 'Blokering klar';
+                        document.getElementById('block-timer').textContent = '';
+                    }
+                }
+                
                 // === FYSIK (lokalt) ===
-                // Gravity
                 myPlayer.vy += GRAVITY;
                 
-                // Knockback
                 myPlayer.vx += myPlayer.knockbackVx;
                 myPlayer.vy += myPlayer.knockbackVy;
                 myPlayer.knockbackVx *= 0.8;
                 myPlayer.knockbackVy *= 0.8;
                 
-                // Position
                 myPlayer.x += myPlayer.vx;
                 myPlayer.y += myPlayer.vy;
                 
-                // Ground collision
                 if (myPlayer.y >= GROUND_Y - myPlayer.height) {
                     myPlayer.y = GROUND_Y - myPlayer.height;
                     myPlayer.vy = 0;
                     myPlayer.onGround = true;
                 }
                 
-                // Wall collision
                 if (myPlayer.x < 0) {
                     myPlayer.x = 0;
                     myPlayer.vx = 0;
@@ -427,19 +485,11 @@
                     myPlayer.vx = 0;
                 }
                 
-                // Friction
                 if (myPlayer.onGround) {
                     myPlayer.vx *= 0.9;
                 }
                 
-                // Cooldowns
                 if (myPlayer.attackCooldown > 0) myPlayer.attackCooldown--;
-                if (myPlayer.blockCooldown > 0) {
-                    myPlayer.blockCooldown--;
-                    if (myPlayer.blockCooldown <= 0) {
-                        document.getElementById('block-cooldown-indicator').textContent = 'Blokering klar';
-                    }
-                }
                 
                 // Send position til server
                 socket.emit('updatePosition', {
@@ -464,6 +514,11 @@
             } else {
                 // Død - respawn timer
                 myPlayer.respawnTimer--;
+                
+                const respawnRemaining = Math.ceil(myPlayer.respawnTimer / 60);
+                document.getElementById('block-indicator').textContent = `Respawn om: ${respawnRemaining}s`;
+                document.getElementById('block-timer').textContent = '';
+                
                 if (myPlayer.respawnTimer <= 0) {
                     myPlayer.alive = true;
                     myPlayer.health = myPlayer.maxHealth;
@@ -473,6 +528,11 @@
                     myPlayer.vy = 0;
                     myPlayer.knockbackVx = 0;
                     myPlayer.knockbackVy = 0;
+                    myPlayer.blockTimer = 0;
+                    myPlayer.blockCooldownTimer = 0;
+                    myPlayer.isBlocking = false;
+                    
+                    document.getElementById('block-indicator').textContent = 'Blokering klar';
                     
                     socket.emit('playerRespawn', {
                         x: myPlayer.x,
@@ -513,20 +573,24 @@
             // === TEGN ALLE ANDRE SPILLERE ===
             Object.values(otherPlayers).forEach(player => {
                 if (!player.alive) return;
-                drawStickFigure(player.x, player.y, player.facingRight, player.isAttacking, 
-                               player.isBlocking, player.color, player.id, player.health);
+                drawStickman(player.x, player.y, player.facingRight, player.isAttacking, 
+                            player.isBlocking, player.color, player.id.substring(0, 4), player.health);
             });
             
             // === TEGN DIG SELV (altid øverst) ===
             if (myPlayer.alive) {
-                drawStickFigure(myPlayer.x, myPlayer.y, myPlayer.facingRight, myPlayer.isAttacking,
-                               myPlayer.isBlocking, myPlayer.color, 'DIG', myPlayer.health);
+                drawStickman(myPlayer.x, myPlayer.y, myPlayer.facingRight, myPlayer.isAttacking,
+                            myPlayer.isBlocking, myPlayer.color, 'DIG', myPlayer.health);
             } else {
                 // Vis respawn timer
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
                 ctx.fillStyle = 'white';
-                ctx.font = 'bold 24px Arial';
+                ctx.font = 'bold 30px Arial';
                 ctx.textAlign = 'center';
-                ctx.fillText(`Respawn om ${Math.ceil(myPlayer.respawnTimer / 60)}s...`, 400, 300);
+                ctx.fillText(`💀 DU DØDE 💀`, 400, 280);
+                ctx.font = 'bold 20px Arial';
+                ctx.fillText(`Respawn om ${Math.ceil(myPlayer.respawnTimer / 60)}s...`, 400, 320);
             }
             
             // === TEGN EFFEKTER ===
@@ -558,99 +622,132 @@
             ctx.fillText(`Spillere: ${aliveCount}`, canvas.width - 10, 20);
         }
 
-        function drawStickFigure(x, y, facingRight, isAttacking, isBlocking, color, name, health) {
+        function drawStickman(x, y, facingRight, isAttacking, isBlocking, color, name, health) {
             ctx.save();
             
-            // Vend hvis nødvendigt
+            // Vend stickman hvis nødvendigt
             if (!facingRight) {
                 ctx.translate(x + 15, 0);
                 ctx.scale(-1, 1);
                 ctx.translate(-(x + 15), 0);
             }
             
-            // Krop
-            ctx.fillStyle = color;
-            ctx.fillRect(x, y, 30, 60);
+            const headX = x + 15;
+            const headY = y;
+            const bodyStartY = y + 20;
+            const bodyEndY = y + 55;
+            const armY = y + 30;
+            const legStartY = y + 55;
+            const legEndY = y + 75;
             
-            // Hoved
-            ctx.fillStyle = '#FFD700';
+            // === STICKMAN KROP ===
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 3;
+            ctx.lineCap = 'round';
+            
+            // Hoved (cirkel)
             ctx.beginPath();
-            ctx.arc(x + 15, y + 10, 12, 0, Math.PI * 2);
-            ctx.fill();
+            ctx.arc(headX, headY + 10, 10, 0, Math.PI * 2);
+            ctx.stroke();
             
             // Øjne
             ctx.fillStyle = 'white';
             ctx.beginPath();
-            ctx.arc(x + 19, y + 8, 4, 0, Math.PI * 2);
+            ctx.arc(headX + 4, headY + 8, 3, 0, Math.PI * 2);
             ctx.fill();
             ctx.fillStyle = 'black';
             ctx.beginPath();
-            ctx.arc(x + 20, y + 8, 2, 0, Math.PI * 2);
+            ctx.arc(headX + 5, headY + 8, 1.5, 0, Math.PI * 2);
             ctx.fill();
             
-            // Arme
+            // Krop (lodret streg)
             ctx.strokeStyle = color;
             ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(headX, bodyStartY);
+            ctx.lineTo(headX, bodyEndY);
+            ctx.stroke();
             
             // Venstre arm
             ctx.beginPath();
-            ctx.moveTo(x, y + 20);
-            ctx.lineTo(x - 10, y + 35);
+            ctx.moveTo(headX, armY);
+            ctx.lineTo(headX - 12, armY + 10);
             ctx.stroke();
             
             // Højre arm (angrebsarm)
             ctx.beginPath();
-            ctx.moveTo(x + 30, y + 20);
+            ctx.moveTo(headX, armY);
             if (isAttacking) {
-                ctx.lineTo(x + 50, y + 10);
+                ctx.lineTo(headX + 25, armY - 10);
             } else {
-                ctx.lineTo(x + 40, y + 35);
+                ctx.lineTo(headX + 12, armY + 10);
             }
             ctx.stroke();
             
-            // Ben
-            ctx.strokeStyle = '#333';
-            ctx.lineWidth = 4;
-            
+            // Venstre ben
             ctx.beginPath();
-            ctx.moveTo(x + 8, y + 60);
-            ctx.lineTo(x + 5, y + 75);
+            ctx.moveTo(headX, legStartY);
+            ctx.lineTo(headX - 8, legEndY);
             ctx.stroke();
             
+            // Højre ben
             ctx.beginPath();
-            ctx.moveTo(x + 22, y + 60);
-            ctx.lineTo(x + 25, y + 75);
+            ctx.moveTo(headX, legStartY);
+            ctx.lineTo(headX + 8, legEndY);
             ctx.stroke();
+            
+            // Knytnæve ved angreb
+            if (isAttacking) {
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.arc(headX + 25, armY - 10, 4, 0, Math.PI * 2);
+                ctx.fill();
+            }
             
             ctx.restore();
             
-            // Blokeringsskjold (tegnes uden for save/restore så det ikke spejlvendes)
+            // === BLOKERINGS-SKJOLD (uden for save/restore så det ikke spejlvendes) ===
             if (isBlocking) {
-                ctx.strokeStyle = 'rgba(100, 200, 255, 0.8)';
-                ctx.lineWidth = 4;
+                // Ydre glød
+                ctx.strokeStyle = 'rgba(100, 200, 255, 0.4)';
+                ctx.lineWidth = 10;
                 ctx.beginPath();
-                ctx.arc(x + 15, y + 30, 35, 0, Math.PI * 2);
+                ctx.arc(x + 15, y + 35, 30, 0, Math.PI * 2);
                 ctx.stroke();
                 
-                ctx.strokeStyle = 'rgba(100, 200, 255, 0.3)';
-                ctx.lineWidth = 8;
+                // Indre skjold
+                ctx.strokeStyle = 'rgba(100, 200, 255, 0.9)';
+                ctx.lineWidth = 3;
                 ctx.beginPath();
-                ctx.arc(x + 15, y + 30, 40, 0, Math.PI * 2);
+                ctx.arc(x + 15, y + 35, 30, 0, Math.PI * 2);
                 ctx.stroke();
+                
+                // Skjold ikon
+                ctx.fillStyle = 'rgba(100, 200, 255, 0.3)';
+                ctx.beginPath();
+                ctx.arc(x + 15, y + 35, 20, 0, Math.PI * 2);
+                ctx.fill();
             }
             
-            // Navn
+            // === NAVN ===
             ctx.fillStyle = 'white';
             ctx.font = 'bold 12px Arial';
             ctx.textAlign = 'center';
-            ctx.fillText(name, x + 15, y - 15);
+            ctx.fillText(name, x + 15, y - 10);
             
-            // Health bar
+            // === LIVSBAR ===
             if (health < 100) {
-                ctx.fillStyle = 'red';
-                ctx.fillRect(x - 5, y - 25, 40, 5);
-                ctx.fillStyle = '#4CAF50';
-                ctx.fillRect(x - 5, y - 25, 40 * (health / 100), 5);
+                const barWidth = 40;
+                const barHeight = 4;
+                const barX = x - 5;
+                const barY = y - 18;
+                
+                ctx.fillStyle = '#333';
+                ctx.fillRect(barX, barY, barWidth, barHeight);
+                
+                const healthColor = health > 60 ? '#4CAF50' : health > 30 ? '#FFA500' : '#FF0000';
+                ctx.fillStyle = healthColor;
+                ctx.fillRect(barX, barY, barWidth * (health / 100), barHeight);
             }
         }
 
@@ -662,7 +759,7 @@
 
         // Start spillet!
         gameLoop();
-        console.log('Spil startet! Din spiller er 100% lokal. Serveren viser dig kun til andre.');
+        console.log('🥊 Stickfight klar! Hold F for at blokere (maks 3 sek, 2 sek cooldown)');
     </script>
 </body>
 </html>
